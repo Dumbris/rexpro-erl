@@ -1,0 +1,9 @@
+{application, rexpro_erl, [
+        {description, "Erlang RexPro client"},
+        {id, "rexpro_erl"},
+        {vsn, "0.1"},
+        {applications, [kernel, stdlib, msgpack]}, % run-time dependencies
+        {modules, []},  % here erlang.mk inserts all application modules, not added automatically, required by relx
+        {mod, {rexpro_erl, []}}, % application callback module
+        {registered, [rexpro_erl]} % required by relx
+        ]}.
