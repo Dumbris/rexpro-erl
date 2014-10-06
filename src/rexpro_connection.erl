@@ -8,182 +8,202 @@
 %%%-------------------------------------------------------------------
 -module(rexpro_connection).
 
--behaviour(gen_fsm).
+-behaviour(gen_server).
 
 %% API
--export([start_link/0]).
+-export([start_link/1]).
 
-%% gen_fsm callbacks
--export([init/1,
-         state_name/2,
-         state_name/3,
-         handle_event/3,
-         handle_sync_event/4,
-         handle_info/3,
-         terminate/3,
-         code_change/4]).
+-include_lib("eunit/include/eunit.hrl").
+-include("rexpro.hrl").
+%% gen_server callbacks
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2,
+	 terminate/2, code_change/3]).
 
--define(SERVER, ?MODULE).
+-define(SERVER, ?MODULE). 
 
--record(state, {}).
+-record(state,
+        {
+          connection :: pid() | inet:socket(),
+          transport  :: atom(),
+          counter = 0 :: non_neg_integer(),
+          session = [] :: [ {non_neg_integer(), none|{result,msgpack:msgpack_term()}|{waiting,term()}} ],
+          frame :: #frame{}
+        }).
 
 %%%===================================================================
 %%% API
 %%%===================================================================
 
-%%--------------------------------------------------------------------
-%% @doc
-%% Creates a gen_fsm process which calls Module:init/1 to
-%% initialize. To ensure a synchronized start-up procedure, this
-%% function does not return until Module:init/1 has returned.
-%%
-%% @spec start_link() -> {ok, Pid} | ignore | {error, Error}
-%% @end
-%%--------------------------------------------------------------------
-start_link() ->
-        gen_fsm:start_link({local, ?SERVER}, ?MODULE, [], []).
+-spec start_link([term()]) -> {ok, pid()} | ignore | {error, Error::term()}.
+start_link(Argv) ->
+    gen_server:start_link(?MODULE, Argv, []).
 
 %%%===================================================================
-%%% gen_fsm callbacks
+%%% gen_server callbacks
 %%%===================================================================
 
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% Whenever a gen_fsm is started using gen_fsm:start/[3,4] or
-%% gen_fsm:start_link/[3,4], this function is called by the new
-%% process to initialize.
-%%
-%% @spec init(Args) -> {ok, StateName, State} |
-%%                     {ok, StateName, State, Timeout} |
-%%                     ignore |
-%%                     {stop, StopReason}
-%% @end
-%%--------------------------------------------------------------------
-init([]) ->
-        {ok, state_name, #state{}}.
+-spec init([term()]) -> {ok, #state{}} | {ok, #state{}, non_neg_integer()} |
+                        ignore | {stop, term()}.
+init(Argv) ->
+    Transport = proplists:get_value(transport, Argv, ranch_tcp),
+    
+    Opts = case Transport of
+               ranch_tcp -> [binary,{packet,raw},{active,once}];
+               ranch_ssl ->
+                   CertFile = proplists:get_value(certfile, Argv),
+                   KeyFile = proplists:get_value(keyfile, Argv),
+                   [binary, {packet, raw}, {active, once},
+                    {certfile, CertFile}, {keyfile, KeyFile}]
+           end,
+    IP   = proplists:get_value(ipaddr, Argv, localhost),
+    Port = proplists:get_value(port,   Argv, 8184),
+    ?debugVal(Opts),
+    {ok, Socket} = Transport:connect(IP, Port, Opts),
+    ok = Transport:controlling_process(Socket, self()),
+    {ok, #state{connection=Socket, transport=Transport, frame=#frame{fragmented = false}}}.
 
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% There should be one instance of this function for each possible
-%% state name. Whenever a gen_fsm receives an event sent using
-%% gen_fsm:send_event/2, the instance of this function with the same
-%% name as the current state name StateName is called to handle
-%% the event. It is also called if a timeout occurs.
-%%
-%% @spec state_name(Event, State) ->
-%%                   {next_state, NextStateName, NextState} |
-%%                   {next_state, NextStateName, NextState, Timeout} |
-%%                   {stop, Reason, NewState}
-%% @end
-%%--------------------------------------------------------------------
-state_name(_Event, State) ->
-        {next_state, state_name, State}.
+-spec handle_call(term(), From::term(), #state{}) ->
+                         {reply, Reply::term(), #state{}} |
+                         {reply, Reply::term(), #state{}, non_neg_integer()} |
+                         {noreply, #state{}} |
+                         {noreply, #state{}, non_neg_integer()} |
+                         {stop, Reason::term(), Reply::term(), #state{}} |
+                         {stop, Reason::term(), #state{}}.
+handle_call({call_async, Method, Argv}, _From,
+            State = #state{connection=Socket, transport=Transport, session=Sessions, counter=Count}) ->
+    CallID = Count,
+    Binary = msgpack:pack([?MP_TYPE_REQUEST, CallID, Method, Argv]),
+    ok=Transport:send(Socket, Binary),
+    ok=Transport:setopts(Socket, [{active,once}]),
+    {reply, {ok, CallID}, State#state{counter=Count+1, session=[{CallID,none}|Sessions]}};
 
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% There should be one instance of this function for each possible
-%% state name. Whenever a gen_fsm receives an event sent using
-%% gen_fsm:sync_send_event/[2,3], the instance of this function with
-%% the same name as the current state name StateName is called to
-%% handle the event.
-%%
-%% @spec state_name(Event, From, State) ->
-%%                   {next_state, NextStateName, NextState} |
-%%                   {next_state, NextStateName, NextState, Timeout} |
-%%                   {reply, Reply, NextStateName, NextState} |
-%%                   {reply, Reply, NextStateName, NextState, Timeout} |
-%%                   {stop, Reason, NewState} |
-%%                   {stop, Reason, Reply, NewState}
-%% @end
-%%--------------------------------------------------------------------
-state_name(_Event, _From, State) ->
-        Reply = ok,
-        {reply, Reply, state_name, State}.
+handle_call({join, CallID}, From, State = #state{session=Sessions0}) ->
+    case lists:keytake(CallID, 1, Sessions0) of
+        false -> {reply, {error, norequest}, State}; % unknown CallID
+        
+        {value, {CallID, none}, Sessions} -> % do receive
+            {noreply, State#state{session=[{CallID,{waiting,From}}|Sessions]}};
+        
+        {value, {CallID, {result, Term}}, Sessions} ->
+            {reply, Term, State#state{session=Sessions}};
+        
+        {value, {CallID, {waiting, From}}, _} ->
+            {reply, {error, waiting}, State};
+	    
+        {value, {CallID, {waiting, From1}}, Sessions1} -> % overwrite
+            {noreply, State#state{session=[{CallID, {waiting, From1}}|Sessions1]}};
+        
+        _ -> % unexpected error
+            {noreply, State}
+    end;
 
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% Whenever a gen_fsm receives an event sent using
-%% gen_fsm:send_all_state_event/2, this function is called to handle
-%% the event.
-%%
-%% @spec handle_event(Event, StateName, State) ->
-%%                   {next_state, NextStateName, NextState} |
-%%                   {next_state, NextStateName, NextState, Timeout} |
-%%                   {stop, Reason, NewState}
-%% @end
-%%--------------------------------------------------------------------
-handle_event(_Event, StateName, State) ->
-        {next_state, StateName, State}.
+handle_call(close, _From, State) ->
+    {stop, normal, ok, State};
 
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% Whenever a gen_fsm receives an event sent using
-%% gen_fsm:sync_send_all_state_event/[2,3], this function is called
-%% to handle the event.
-%%
-%% @spec handle_sync_event(Event, From, StateName, State) ->
-%%                   {next_state, NextStateName, NextState} |
-%%                   {next_state, NextStateName, NextState, Timeout} |
-%%                   {reply, Reply, NextStateName, NextState} |
-%%                   {reply, Reply, NextStateName, NextState, Timeout} |
-%%                   {stop, Reason, NewState} |
-%%                   {stop, Reason, Reply, NewState}
-%% @end
-%%--------------------------------------------------------------------
-handle_sync_event(_Event, _From, StateName, State) ->
-        Reply = ok,
-        {reply, Reply, StateName, State}.
+handle_call(_Request, _From, State) ->
+    {reply, {error, badevent}, State}.
 
-%%--------------------------------------------------------------------
-%% @private
-%% @doc
-%% This function is called by a gen_fsm when it receives any
-%% message other than a synchronous or asynchronous event
-%% (or a system message).
-%%
-%% @spec handle_info(Info,StateName,State)->
-%%                   {next_state, NextStateName, NextState} |
-%%                   {next_state, NextStateName, NextState, Timeout} |
-%%                   {stop, Reason, NewState}
-%% @end
-%%--------------------------------------------------------------------
-handle_info(_Info, StateName, State) ->
-        {next_state, StateName, State}.
+-spec handle_cast(term(), #state{}) ->
+                         {noreply, Reply::term(), #state{}} |
+                         {noreply, Reply::term(), #state{}, non_neg_integer()} |
+                         {stop, Reason::term(), #state{}}.
+handle_cast({notify, Method, Argv}, State = #state{connection=Socket, transport=Transport}) ->
+    
+    Binary = msgpack:pack([?MP_TYPE_NOTIFY, Method, Argv]),
+    ok=Transport:send(Socket, Binary),
+    {noreply, State};
 
-%%--------------------------------------------------------------------
-%% @private
+handle_cast(_Msg, State)                                                                    ->
+    {noreply, State}.
+
+%Unpack in transient process
+-spec unpack_frame_data(Frame :: #frame{}) -> any().
+%Session	byte(16)
+%Request	byte(16)
+%Meta	Map	Not applicable for this message
+%ErrorMessage	String	The error message from the server.
+unpack_frame_data(Frame = #frame{serializer = ?SERIALIZER_MSGPACK, type = ?ERROR_RESPONSE}) ->
+    {ok, [Session, Request, _Meta, ErrorMessage]} = msgpack:unpack(Frame2#frame.payload, [{enable_str, true}]);
+    [Session, Request, ErrorMessage].
+
+%Session	byte(16)
+%Request	byte(16)
+%Meta	Map	Not applicable for this message
+%Results	Object	The result serialized by MsgPack. Any result not serializable by MsgPack is converted via toString.
+%Bindings	Map	Once the script is executed any bindings on the Script Engine that can be serialized via MsgPack are returned. Any that cannot be properly serialized are converted via toString.
+unpack_frame_data(Frame = #frame{serializer = ?SERIALIZER_MSGPACK, type = ?SESSION_RESPONSE}) ->
+    {ok, [Session, Request, _Meta, Results, Bindings]} = msgpack:unpack(Frame2#frame.payload, [{enable_str, true}]);
+    [Session, Request, _Meta, Results, Bindings].
+unpack_frame_data(Frame = #frame{serializer = ?SERIALIZER_MSGPACK, type = ?SCRIPT_RESPONSE}) ->
+unpack_frame_data(Frame = #frame{serializer = ?SERIALIZER_JSON}) ->
+    %TODO
+    {error, not_supported_serializer}
+
+process_buffer(Binary, Frame = #frame{fragmented = Fragmented}) ->
+    case rexpro_framing:from_binary(Binary, Fragmented, Frame) of
+        {ok, Frame2, Rest} ->
+
+
 %% @doc
-%% This function is called by a gen_fsm when it is about to
+%% Handling all non call/cast messages
+-spec handle_info(term(), #state{}) ->
+                         {noreply, Reply::term(), #state{}} |
+                         {noreply, Reply::term(), #state{}, non_neg_integer()} |
+                         {stop, Reason::term(), #state{}}.
+%TCP Message can contain several frames or just fragment of Frame
+handle_info({TCP_or_SSL, Socket, Binary},
+            State = #state{transport=Transport,session=Sessions0, frame=Frame = #frame{fragmented = Fragmented}})
+
+  when TCP_or_SSL =:= tcp orelse TCP_or_SSL =:= ssl -> % this guard is quickhack; FIXME
+    
+    {Action, State2} = case rexpro_framing:from_binary(Binary, Fragmented, Frame) of
+        {ok, Frame2, Rest} ->
+            unpack_frame_data(Frame2#frame.payload)
+            {ok, Data} = msgpack:unpack(Frame2#frame.payload, [{enable_str, true}]);
+            [?MP_TYPE_RESPONSE, CallID, ResCode, Result] = Data,
+            case lists:keytake(CallID, 1, Sessions0) of
+                false -> {noreply, State};
+                {value, {CallID, none}, Sessions} ->
+                    {noreply, State#state{session=[{CallID, {result, Retval}}|Sessions],
+                                          buffer=Remain}};
+                {value, {CallID, {waiting, From}}, Sessions} ->
+                    gen_server:reply(From, Retval),
+                    {noreply, State#state{session=Sessions, buffer=Remain}}
+            end
+        {ok, Frame2 = #frame{serializer = ?SERIALIZER_JSON}} ->
+            gen_server:reply(From, Retval),
+            {noreply, State#state{session=Sessions, frame=#frame{fragmented=false}}}
+        {fragment, Frame2} ->
+            ok=Transport:setopts(Socket, [{active,once}]),
+            {noreply, State#state{frame=Frame2}}
+    end,
+    ok=Transport:setopts(Socket, [{active,once}]),
+    {Action, State2};
+    
+handle_info({tcp_closed, Socket}, State = #state{connection=Socket}) ->
+    {stop, unexpected_close, State};
+handle_info(_Info, State = #state{connection=Socket,transport=Transport}) ->
+    ?debugVal(_Info),
+    ok=Transport:setopts(Socket, [{active,once}]),
+    {noreply, State}.
+
+%% @doc
+%% This function is called by a gen_server when it is about to
 %% terminate. It should be the opposite of Module:init/1 and do any
-%% necessary cleaning up. When it returns, the gen_fsm terminates with
-%% Reason. The return value is ignored.
-%%
-%% @spec terminate(Reason, StateName, State) -> void()
-%% @end
-%%--------------------------------------------------------------------
-terminate(_Reason, _StateName, _State) ->
-        ok.
+%% necessary cleaning up. When it returns, the gen_server terminates
+%% with Reason. The return value is ignored.
+-spec terminate(term(), #state{}) -> ok. % void().
+terminate(_Reason, _State = #state{connection=Socket, transport=Transport}) ->
+    Transport:close(Socket),
+    ok.
 
 %%--------------------------------------------------------------------
 %% @private
 %% @doc
 %% Convert process state when code is changed
 %%
-%% @spec code_change(OldVsn, StateName, State, Extra) ->
-%%                   {ok, StateName, NewState}
+%% @spec code_change(OldVsn, State, Extra) -> {ok, NewState}
 %% @end
 %%--------------------------------------------------------------------
-code_change(_OldVsn, StateName, State, _Extra) ->
-        {ok, StateName, State}.
-
-%%%===================================================================
-%%% Internal functions
-%%%===================================================================
-
-
-
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
