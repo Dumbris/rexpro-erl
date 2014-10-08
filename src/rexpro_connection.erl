@@ -27,7 +27,8 @@
           transport  :: atom(),
           counter = 0 :: non_neg_integer(),
           session = [] :: [ {non_neg_integer(), none|{result,msgpack:msgpack_term()}|{waiting,term()}} ],
-          frame :: #frame{}
+          frame :: #frame{}, %last fragmented frame
+          buffer :: binary()  
         }).
 
 %%%===================================================================
@@ -137,11 +138,23 @@ unpack_frame_data(Frame = #frame{serializer = ?SERIALIZER_MSGPACK, type = ?SESSI
 unpack_frame_data(Frame = #frame{serializer = ?SERIALIZER_MSGPACK, type = ?SCRIPT_RESPONSE}) ->
 unpack_frame_data(Frame = #frame{serializer = ?SERIALIZER_JSON}) ->
     %TODO
-    {error, not_supported_serializer}
+    {error, not_supported_serializer}.
 
-process_buffer(Binary, Frame = #frame{fragmented = Fragmented}) ->
+-spec process_buffer(binary(), #frame{}, list(#frame{})) -> tuple(binary(), #frame{} | none, list(#frame{}) | []).
+process_buffer(Binary, Frame = #frame{fragmented = Fragmented}, Acc) ->
     case rexpro_framing:from_binary(Binary, Fragmented, Frame) of
         {ok, Frame2, Rest} ->
+            process_buffer(Rest, #frame{}, [Frame2 | Acc]);
+        {fragment, Frame2, Rest} ->
+            process_buffer(Rest, Frame2, Acc);
+        {toosmall, Frame2, Rest} ->
+            {Rest, Frame2, Acc};
+        _Else ->
+            error("process_buffer error")
+    end;
+
+process_buffer(<<>>, Frame, Acc) ->
+            {<<>>, Frame, Acc}.
 
 
 %% @doc
@@ -152,31 +165,30 @@ process_buffer(Binary, Frame = #frame{fragmented = Fragmented}) ->
                          {stop, Reason::term(), #state{}}.
 %TCP Message can contain several frames or just fragment of Frame
 handle_info({TCP_or_SSL, Socket, Binary},
-            State = #state{transport=Transport,session=Sessions0, frame=Frame = #frame{fragmented = Fragmented}})
+            State = #state{transport=Transport,session=Sessions0, buffer = Buffer, frame=Frame = #frame{fragmented = Fragmented}})
 
   when TCP_or_SSL =:= tcp orelse TCP_or_SSL =:= ssl -> % this guard is quickhack; FIXME
-    
-    {Action, State2} = case rexpro_framing:from_binary(Binary, Fragmented, Frame) of
-        {ok, Frame2, Rest} ->
-            unpack_frame_data(Frame2#frame.payload)
-            {ok, Data} = msgpack:unpack(Frame2#frame.payload, [{enable_str, true}]);
-            [?MP_TYPE_RESPONSE, CallID, ResCode, Result] = Data,
-            case lists:keytake(CallID, 1, Sessions0) of
-                false -> {noreply, State};
-                {value, {CallID, none}, Sessions} ->
-                    {noreply, State#state{session=[{CallID, {result, Retval}}|Sessions],
-                                          buffer=Remain}};
-                {value, {CallID, {waiting, From}}, Sessions} ->
-                    gen_server:reply(From, Retval),
-                    {noreply, State#state{session=Sessions, buffer=Remain}}
-            end
-        {ok, Frame2 = #frame{serializer = ?SERIALIZER_JSON}} ->
-            gen_server:reply(From, Retval),
-            {noreply, State#state{session=Sessions, frame=#frame{fragmented=false}}}
-        {fragment, Frame2} ->
-            ok=Transport:setopts(Socket, [{active,once}]),
-            {noreply, State#state{frame=Frame2}}
-    end,
+    Buffer2 = << Buffer/binary, Binary/binary >>,
+    {Buffer3, FragmentedFrame, Frames} = process_buffer(Buffer2, Frame, []),
+    %Process Frames
+                unpack_frame_data(Frame2#frame.payload)
+                {ok, Data} = msgpack:unpack(Frame2#frame.payload, [{enable_str, true}]);
+                [?MP_TYPE_RESPONSE, CallID, ResCode, Result] = Data,
+                case lists:keytake(CallID, 1, Sessions0) of
+                    false -> {noreply, State};
+                    {value, {CallID, none}, Sessions} ->
+                        {noreply, State#state{session=[{CallID, {result, Retval}}|Sessions],
+                                              buffer=Remain}};
+                    {value, {CallID, {waiting, From}}, Sessions} ->
+                        gen_server:reply(From, Retval),
+                        {noreply, State#state{session=Sessions, buffer=Remain}}
+                end
+            {ok, Frame2 = #frame{serializer = ?SERIALIZER_JSON}} ->
+                gen_server:reply(From, Retval),
+                {noreply, State#state{session=Sessions, frame=#frame{fragmented=false}}}
+            {fragment, Frame2} ->
+                ok=Transport:setopts(Socket, [{active,once}]),
+                {noreply, State#state{frame=Frame2}}
     ok=Transport:setopts(Socket, [{active,once}]),
     {Action, State2};
     
